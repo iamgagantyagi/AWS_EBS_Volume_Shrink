@@ -1,0 +1,50 @@
+---
+- hosts: localhost
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+
+  vars:
+    region: us-west-2  #This will be replaced via script during run time.
+    INSTANCE_NAME: "{{ inventory_hostname }}"
+
+  vars_files:
+    - credentials.yaml
+
+  tasks:
+  - name: Get Instance ID
+    delegate_to: localhost
+    connection: local
+    command: aws ec2 describe-instances --region {{ region }} --filters "Name=tag:Name,Values={{ inventory_hostname }}" --query "Reservations[].Instances[].InstanceId" --output text
+    register: INSTANCE_ID
+
+  - name: Get Availability Zone
+    delegate_to: localhost
+    connection: local
+    command: aws ec2 describe-instances --region '{{ region }}' --instance-ids '{{ INSTANCE_ID.stdout }}' --query 'Reservations[].Instances[].Placement.AvailabilityZone' --output text
+    register: Availability_Zone
+    when: INSTANCE_ID.stdout_lines[0] | length != 0
+
+  - name: Get volume root ID
+    delegate_to: localhost
+    connection: local
+    command: aws ec2 describe-instances --region '{{ region }}' --instance-ids '{{ INSTANCE_ID.stdout }}' --query "Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId" --output text
+    register: volume_id1
+
+  - name: Get volume data ID
+    delegate_to: localhost
+    connection: local
+    command: aws ec2 describe-instances --region '{{ region }}' --instance-ids '{{ INSTANCE_ID.stdout }}' --query "Reservations[0].Instances[0].BlockDeviceMappings[1].Ebs.VolumeId" --output text
+    register: volume_id2
+  
+  - name: Define volume infomation
+    set_fact:
+     volumes:
+      - { mount_point: "/", volume_id: "{{ volume_id1.stdout }}" }
+      - { mount_point: "/data", volume_id: "{{ volume_id2.stdout }}" }
+
+  - name: Set mount points and loop through volumes
+    include_tasks: manage_volume.yaml
+    with_items: "{{ volumes }}"
+    loop_control:
+      loop_var: volume_info

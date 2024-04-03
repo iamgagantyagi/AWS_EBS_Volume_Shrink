@@ -1,0 +1,172 @@
+  - name: Get Volume size
+    delegate_to: localhost
+    connection: local
+    command: aws ec2 describe-volumes --region '{{ region }}' --volume-ids '{{ volume_info.volume_id }}' --query "Volumes[0].Size" --output text
+    register: volume_size
+
+  - name: Get Utilization
+    shell: df -h | awk '{ if($6 == "{{ volume_info.mount_point }}" ) print $5 }'| tr -d '%'
+    register: utilization
+    when: INSTANCE_ID.stdout_lines[0] | length != 0
+    delegate_to: "{{ INSTANCE_NAME }}"
+
+  - name: Compare utilization with threshold
+    when: utilization.stdout | int <= 50
+    block:
+      - name: Debug over-provisioning
+        delegate_to: localhost
+        connection: local
+        debug:
+          msg: "Volume ID: {{ volume_info.volume_id }} is over-provisioned, we can shrink"
+
+      - name: Take a snapshot of the EBS volume
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 create-snapshot --region '{{ region }}' --volume-id '{{ volume_info.volume_id }}' --description '{{ INSTANCE_NAME }}-volume-backup'
+        register: snapshot_result
+        changed_when: snapshot_result.rc == 0
+
+      - name: Get used Volume Size
+        shell: df -h | awk '{ if($6 == "{{ volume_info.mount_point }}" ) print $3 }' | tr -d 'G'
+        register: used_size
+        delegate_to: "{{ INSTANCE_NAME }}"
+
+      - name: New Volume Size Calculation
+        delegate_to: localhost
+        connection: local
+        set_fact:
+          calculated_size: "{{ used_size.stdout | float * 2 }}"
+
+      - name: EBS Volume Creation
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 create-volume --region '{{ region }}' --availability-zone '{{ Availability_Zone.stdout }}' --size '{{ calculated_size |int }}' --volume-type gp3 --query 'VolumeId' --output text
+        register: new_volume_id
+        changed_when: new_volume_id.rc == 0
+
+      - name: Get Volume state
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 describe-volumes --region '{{ region }}' --volume-ids '{{ new_volume_id.stdout }}' --query 'Volumes[0].State' --output text
+        register: Volume_state
+        ignore_errors: true
+        until: Volume_state.stdout == "available"
+        retries: 10
+        delay: 20
+
+      - name: Device name
+        delegate_to: localhost
+        connection: local
+        shell: aws ec2 describe-instances --region '{{ region }}' --instance-id '{{ INSTANCE_ID.stdout }}' --query "Reservations[*].Instances[*].BlockDeviceMappings[*].DeviceName[]" --output text | awk '{print $NF}' | sed 's/.*\///' | tail -c 2
+        register: last_char
+
+      - name: Translate Character - Range(a-e)
+        delegate_to: localhost
+        connection: local
+        shell: aws ec2 describe-instances --region '{{ region }}' --instance-id '{{ INSTANCE_ID.stdout }}' --query "Reservations[*].Instances[*].BlockDeviceMappings[*].DeviceName[]" --output text | awk '{print $NF}' | sed 's/.*\///' | tail -c 2 | tr '[a-f]' '[e-q]'
+        register: translated_char_ae
+        when: last_char.stdout is search('[a-e]')
+
+      - name: Translate Character - Range(f-o)
+        delegate_to: localhost
+        connection: local
+        shell: aws ec2 describe-instances --region '{{ region }}' --instance-id '{{ INSTANCE_ID.stdout }}' --query "Reservations[*].Instances[*].BlockDeviceMappings[*].DeviceName[]" --output text | awk '{print $NF}' | sed 's/.*\///' | tail -c 2 | tr '[e-p]' '[f-o]'
+        register: translated_char_fo
+        when: last_char.stdout is search('[f-o]')
+
+      - name: Attach volume ae
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 attach-volume --region '{{ region }}' --volume-id '{{ new_volume_id.stdout }}' --instance-id '{{ INSTANCE_ID.stdout }}' --device /dev/sd{{ translated_char_ae.stdout }}
+        when: last_char.stdout is search('[a-e]')
+
+      - name: Attach volume fo
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 attach-volume --region '{{ region }}' --volume-id '{{ new_volume_id.stdout }}' --instance-id '{{ INSTANCE_ID.stdout }}' --device /dev/sd{{ translated_char_fo.stdout }}
+        when: last_char.stdout is search('[f-o]')
+
+      - name: Get Volume status
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 describe-volumes --region '{{ region }}' --volume-ids '{{ new_volume_id.stdout }}' --query 'Volumes[0].Attachments[0].State' --output text
+        register: Volume_status
+        ignore_errors: true
+        until: Volume_status.stdout == "attached"
+        retries: 10
+        delay: 20
+
+      - name: Copying remote script
+        become: true
+        copy: src=files/remote.sh dest=/tmp/ mode=0755
+        delegate_to: "{{ INSTANCE_NAME }}"
+
+      - name: Executing script on remote host
+        become: true
+        become_method: sudo
+        command: bash /tmp/remote.sh
+        environment:
+          size: "{{ calculated_size |int}}"
+          mount_point: "{{ volume_info.mount_point }}"
+        delegate_to: "{{ INSTANCE_NAME }}"
+
+      - name: Instance Stop
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 stop-instances --instance-ids '{{ INSTANCE_ID.stdout }}' --region {{ region }}
+
+      - name: Get Instance status
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 describe-instances --region '{{ region }}' --filters 'Name=tag:Name,Values= {{ INSTANCE_NAME }}' --query 'Reservations[*].Instances[*].State.Name' --output text
+        register: Instance_status
+        ignore_errors: true
+        until: Instance_status.stdout == "stopped"
+        retries: 10
+        delay: 20
+
+      - name: Volume detachment other than root
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 detach-volume --region '{{ region }}' --volume-id '{{ volume_info.volume_id }}'
+        when: Instance_status.stdout == "stopped"
+
+      - name: Volume detachment for root
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 detach-volume --region '{{ region }}' --volume-id '{{ new_volume_id.stdout }}'
+        when: volume_info.mount_point == "/"
+
+      - name: Attach new root volume
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 attach-volume --region '{{ region }}' --volume-id '{{ new_volume_id.stdout }}' --instance-id '{{ INSTANCE_ID.stdout }}' --device /dev/sda1
+        when: volume_info.mount_point == "/"
+   
+      - name: Instance start
+        delegate_to: localhost
+        connection: local
+        command: aws ec2 start-instances --region '{{ region }}' --instance-ids '{{ INSTANCE_ID.stdout }}'
+        register: instance_start_status
+        changed_when: instance_start_status.rc == 0
+
+      - name: Wait 180 seconds, but only start checking after 30 seconds
+        delegate_to: localhost
+        connection: local
+        wait_for_connection:
+         delay: 30
+         timeout: 180
+
+  - name: Debug volume not over-provisioned
+    delegate_to: localhost
+    connection: local
+    when: utilization.stdout | int > 50
+    debug:
+      msg: "Volume ID: {{ volume_info.volume_id }} is not over-provisioned."
+
+  - name: Debug volume not attached to any instance
+    delegate_to: localhost
+    connection: local
+    when: INSTANCE_ID.stdout == "None"
+    debug:
+      msg: "Volume is not attached to any instance."
