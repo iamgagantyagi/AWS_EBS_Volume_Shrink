@@ -1,5 +1,5 @@
 # AWS_EBS_Volume_Shrink
-This Repository Contains scripts and playbook that can be used to downsize the ebs volume attached to ec2 instance with zero time.
+This Repository Contains scripts and playbook that can be used to downsize the ebs volume attached to ec2 instance with zero downtime.
 
 <!-- Introduction -->
 ## Introduction
